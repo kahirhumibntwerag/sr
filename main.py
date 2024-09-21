@@ -1,47 +1,145 @@
-from data.LoadData import load_single_aws_zarr, AWS_ZARR_ROOT, s3_connection
-from data.Dataset import Dataset
-import torch.nn.functional as F
-from RRDB.src.RRDB import Generator
+# Documentation Link
+# https://lightning.ai/docs/pytorch/stable/levels/advanced_level_15.html
+
+import lightning.pytorch as pl
 import torch
-import torch.nn as nn
+from lightning.pytorch.callbacks import ModelSummary
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+
+# We will use the LightningCLI to run the training
+from lightning.pytorch.cli import LightningCLI
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
-from torch.utils.data import DataLoader
-import dask.array as da
-import matplotlib.pyplot as plt
-import yaml
+from torchvision.datasets import MNIST
 
 
-def load_config(config_path):
-    with open(config_path, 'r') as file:
-        return yaml.safe_load(file)
-    
+class MNISTDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir: str = "./"):
+        super().__init__()
+        self.data_dir = data_dir
+        self.transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+        )
 
-root = load_single_aws_zarr(
-    path_to_zarr=AWS_ZARR_ROOT+str(2015),
+    def prepare_data(self):
+        # download
+        MNIST(self.data_dir, train=True, download=True)
+        MNIST(self.data_dir, train=False, download=True)
+
+    def setup(self, stage: str):
+        # Assign train/val datasets for use in dataloaders
+        if stage == "fit":
+            mnist_full = MNIST(self.data_dir, train=True, transform=self.transform)
+            self.mnist_train, self.mnist_val = random_split(mnist_full, [55000, 5000])
+
+        # Assign test dataset for use in dataloader(s)
+        if stage == "test":
+            self.mnist_test = MNIST(
+                self.data_dir, train=False, transform=self.transform
+            )
+
+        if stage == "predict":
+            self.mnist_predict = MNIST(
+                self.data_dir, train=False, transform=self.transform
+            )
+
+    def train_dataloader(self):
+        return DataLoader(self.mnist_train, batch_size=32)
+
+    def val_dataloader(self):
+        return DataLoader(self.mnist_val, batch_size=32)
+
+    def test_dataloader(self):
+        return DataLoader(self.mnist_test, batch_size=32)
+
+    def predict_dataloader(self):
+        return DataLoader(self.mnist_predict, batch_size=32)
+
+
+class LitConvClassifier(pl.LightningModule):
+    def __init__(self, learning_rate=1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        self.example_input_array = torch.rand(1, 1, 28, 28)
+
+        self.learning_rate = learning_rate
+
+        # Define blocks of layers as submodules
+        self.conv_block1 = nn.Sequential(
+            nn.Conv2d(1, 32, 3, stride=1, padding=1), nn.ReLU(), nn.MaxPool2d(2)
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=1, padding=1), nn.ReLU(), nn.MaxPool2d(2)
+        )
+
+        self.fc_block = nn.Sequential(
+            nn.Linear(64 * 7 * 7, 128), nn.ReLU(), nn.Linear(128, 10)
+        )
+
+    def forward(self, x):
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_block(x)
+        return x
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        self.log("val_loss", loss)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        return loss
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        x, _ = batch
+        return self(x)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return optimizer
+
+
+data_module = MNISTDataModule
+model = LitConvClassifier
+
+# To use the CLI we do not initialize the trainer class separately
+# We pass the model, data module, trainer defaults to the LightningCLI function directly
+# As you can see here the trainer_defaults are the same as the ones we used in the previous example
+
+
+def cli_main(model, data_module):
+    cli = LightningCLI(
+        model_class=LitConvClassifier,
+        datamodule_class=MNISTDataModule,
+        trainer_class=pl.Trainer,
+        trainer_defaults={
+            "max_epochs": 1,
+            "default_root_dir": "experiments/",
+            "callbacks": [
+                EarlyStopping(monitor="val_loss", mode="min"),
+                ModelSummary(max_depth=-1),
+            ],
+            "precision": "16-mixed",
+            "limit_train_batches": 0.1,
+            "limit_val_batches": 0.01,
+        },
     )
 
-data = root['171A']
-data = da.from_array(data)
-hr = torch.from_numpy(data[46543].compute()).unsqueeze(0).unsqueeze(0)
-lr = F.interpolate(hr, size=(128, 128), mode='bilinear', align_corners=False)
 
-config = load_config(r'C:\Users\mhesh\OneDrive\Desktop\pro\SR\config\config.yml')
-generator = Generator(
-        in_channels=config['RRDB']['in_channels'],
-        initial_channel=config['RRDB']['initial_channel'],
-        num_rrdb_blocks=config['RRDB']['num_rrdb_blocks'],
-        upscale_factor=config['RRDB']['upscale_factor']
-    )
-
-state_dict = torch.load(r'C:\Users\mhesh\OneDrive\Desktop\pro\SR\generator.pth')
-# Load the state dictionary into the model
-generator.load_state_dict(state_dict)
-
-with torch.no_grad():
-    generator.to('cuda')
-    lr = lr.to('cuda')
-    sr = generator(lr)
-    sr = sr.squeeze(0).squeeze(0).cpu().numpy()
-    plt.imshow(sr, cmap='afmhot')
-    plt.show()
-
+if __name__ == "__main__":
+    cli_main(model, data_module)

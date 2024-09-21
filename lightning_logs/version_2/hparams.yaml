@@ -1,0 +1,6 @@
+in_channels: 1
+initial_channel: 64
+num_rrdb_blocks: 4
+upscale_factor: 8
+lr: 0.001
+_instantiator: lightning.pytorch.cli.instantiate_module
